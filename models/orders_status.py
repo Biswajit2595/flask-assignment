@@ -2,35 +2,33 @@ from enum import Enum
 
 
 class OrderStatus(str, Enum):
-    # Order created, waiting for worker to pick it up
+    """ Possible lifecycle states of an order."""
+    # Order created and waiting to be processed by a worker
     PENDING = "PENDING"
 
-    # Worker is actively attempting payment
+    # Worker is attempting to process payment
     PAYMENT_PROCESSING = "PAYMENT_PROCESSING"
 
-    # Payment attempt failed (may still retry)
+    # Payment attempt failed but may still be retried
     PAYMENT_FAILED = "PAYMENT_FAILED"
 
-    # Worker is actively checking inventory
+    # Worker is checking inventory availability
     INVENTORY_PROCESSING = "INVENTORY_PROCESSING"
 
-    # Inventory check failed (may still retry)
+    # Inventory check failed but may still be retried
     INVENTORY_CHECK_FAILED = "INVENTORY_CHECK_FAILED"
 
-    # Legacy — kept for backwards compat
+    # Legacy state kept for backward compatibility
     INVENTORY_CHECK = "INVENTORY_CHECK"
 
-    # FIX (BUG 1): Added missing INVENTORY_RESERVED state.
-    # order_processor.py sets this after inventory is successfully reserved,
-    # but this value was never defined in the enum — causing an AttributeError
-    # crash on every single successful inventory check.
+    # Inventory successfully reserved for the order
     INVENTORY_RESERVED = "INVENTORY_RESERVED"
 
-    # All steps passed
+    # Order completed successfully
     COMPLETED = "COMPLETED"
 
-    # Exhausted all retries, order could not be fulfilled
+    # Order failed after exhausting retries
     FAILED = "FAILED"
 
-    # Explicitly cancelled by user
+    # Order cancelled by the user
     CANCELLED = "CANCELLED"
