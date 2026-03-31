@@ -1,328 +1,122 @@
 # Design Document: Flask Order Management System
 
-## Table of Contents
+## 1. System Architecture
 
-1. [System Overview](#system-overview)
-2. [Architecture](#architecture)
-3. [Data Flow](#data-flow)
-4. [Component Design](#component-design)
-5. [Failure Scenarios & Recovery](#failure-scenarios--recovery)
-6. [Alternative Architectures Considered](#alternative-architectures-considered)
-7. [Error Handling & Resilience](#error-handling--resilience)
-8. [Security Considerations](#security-considerations)
-9. [Performance & Scalability](#performance--scalability)
-10. [Future Enhancements](#future-enhancements)
+**Layers:**
 
-## System Overview
+- **API Layer:** Flask app with Blueprints for order endpoints, input validation via Marshmallow.
+- **Business Logic Layer:** Services for order processing, payment, and inventory.
+- **Worker Layer:** Background workers for async order processing and recovery.
+- **Data Layer:** SQLAlchemy models, SQLite database.
 
-The Flask Order Management System is designed to handle order processing in an e-commerce context. The system provides REST APIs for order creation, retrieval, listing, and cancellation, with asynchronous background processing to ensure reliability and performance.
-
-### Key Requirements
-
-- **Reliability**: Orders must be processed reliably with proper error handling and retry logic
-- **Idempotency**: Duplicate requests should not create duplicate orders
-- **Asynchronous Processing**: API responses should not be blocked by long-running operations
-- **Cancellation Support**: Users should be able to cancel orders before completion
-- **Observability**: Comprehensive logging and status tracking for debugging and monitoring
-
-## Architecture
-
-### High-Level Architecture
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Client Apps   │────│   Flask API     │────│   Background    │
-│                 │    │   (Routes)      │    │   Workers       │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                │                       │
-                                ▼                       ▼
-                       ┌─────────────────┐    ┌─────────────────┐
-                       │   Database      │    │   External      │
-                       │   (SQLAlchemy)  │    │   Services      │
-                       └─────────────────┘    │   (Payment/Inv) │
-                                              └─────────────────┘
-```
-
-### Component Breakdown
-
-#### 1. API Layer (`routes/`)
-
-- **Purpose**: Handle HTTP requests and responses
-- **Technology**: Flask Blueprints
-- **Responsibilities**:
-  - Request validation using Marshmallow schemas
-  - Idempotency key handling
-  - Response formatting
-  - Error handling and status codes
-
-#### 2. Business Logic Layer (`services/`)
-
-- **Purpose**: Core business logic and external integrations
-- **Components**:
-  - `order_processor.py`: Main order processing orchestration
-  - `payment_service.py`: Payment gateway integration
-  - `inventory_service.py`: Inventory management
-- **Responsibilities**:
-  - Order state management
-  - External service calls
-  - Retry logic and error handling
-
-#### 3. Data Layer (`models/`)
-
-- **Purpose**: Data persistence and business object modeling
-- **Technology**: SQLAlchemy ORM
-- **Components**:
-  - `Order` model with status tracking
-  - `OrderStatus` enum for state management
-- **Responsibilities**:
-  - Database schema definition
-  - Data validation and constraints
-  - Audit trail (created_at, updated_at)
-
-#### 4. Worker Layer (`workers/`)
-
-- **Purpose**: Asynchronous task processing
-- **Technology**: Threading with in-memory queue
-- **Components**:
-  - `order_worker.py`: Main processing worker
-  - `recovery_worker.py`: Failed order recovery
-  - `queue.py`: Thread-safe queue implementation
-- **Responsibilities**:
-  - Background order processing
-  - Graceful shutdown handling
-  - Worker lifecycle management
-
-#### 5. Utilities (`utils/`)
-
-- **Purpose**: Shared utilities and cross-cutting concerns
-- **Components**:
-  - `logger.py`: Structured logging configuration
-- **Responsibilities**:
-  - Consistent logging across components
-  - Log formatting and levels
-
-## Data Flow
-
-### Order Creation Flow
+**Diagram:**
 
 ```mermaid
-sequenceDiagram
-    participant Client
-    participant API
-    participant DB
-    participant Queue
-    participant Worker
-
-    Client->>API: POST /orders (with Idempotency-Key)
-    API->>DB: Check for existing order
-    DB-->>API: Return existing or create new
-    API->>DB: Save order (PENDING)
-    API->>Queue: Enqueue order_id
-    API-->>Client: Return order details
-    Worker->>Queue: Dequeue order_id
-    Worker->>DB: Fetch order details
-    Worker->>Worker: Process order (inventory + payment)
-    Worker->>DB: Update order status
+graph TB
+    Client[Client App] --> API[Flask API]
+    API --> DB[(SQLite DB)]
+    API --> Queue[Order Queue]
+    Queue --> Worker[Order Worker]
+    Queue --> Recovery[Recovery Worker]
+    Worker --> DB
+    Recovery --> DB
 ```
 
-### Order Processing Flow
+---
+
+## 2. Order State Machine
+
+**States:**
+
+- PENDING → INVENTORY_PROCESSING → INVENTORY_RESERVED → PAYMENT_PROCESSING → COMPLETED/FAILED
+- Orders can be CANCELLED from any non-terminal state.
+
+**Diagram:**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: Order Created via API
-    PENDING --> INVENTORY_PROCESSING: Worker Dequeues Order
-    INVENTORY_PROCESSING --> INVENTORY_RESERVED: Inventory Available
-    INVENTORY_PROCESSING --> PENDING: Inventory Unavailable<br/>(Retry)
-    INVENTORY_PROCESSING --> FAILED: Max Inventory Retries<br/>Exceeded
-
-    INVENTORY_RESERVED --> PAYMENT_PROCESSING: Start Payment
-    PAYMENT_PROCESSING --> COMPLETED: Payment Successful
-    PAYMENT_PROCESSING --> INVENTORY_RESERVED: Payment Failed<br/>(Retry)
-    PAYMENT_PROCESSING --> FAILED: Max Payment Retries<br/>Exceeded +<br/>Inventory Released
-
-    PENDING --> CANCELLED: User Cancellation
-    INVENTORY_RESERVED --> CANCELLED: User Cancellation<br/>(Inventory Released)
-    PAYMENT_PROCESSING --> CANCELLED: User Cancellation<br/>(Payment Refund +<br/>Inventory Released)
-
-    COMPLETED --> [*]: Order Fulfilled
-    FAILED --> [*]: Order Failed
-    CANCELLED --> [*]: Order Cancelled
-
-    note right of INVENTORY_PROCESSING
-        check_inventory()
-        Reserve items if available
-    end note
-
-    note right of PAYMENT_PROCESSING
-        process_payment()
-        Charge customer
-    end note
-
-    note left of CANCELLED
-        Atomic conditional update
-        Prevents race conditions
-    end note
+    [*] --> PENDING
+    PENDING --> INVENTORY_PROCESSING
+    INVENTORY_PROCESSING --> INVENTORY_RESERVED: success
+    INVENTORY_PROCESSING --> PENDING: retry
+    INVENTORY_PROCESSING --> FAILED: max retries
+    INVENTORY_RESERVED --> PAYMENT_PROCESSING
+    PAYMENT_PROCESSING --> COMPLETED: success
+    PAYMENT_PROCESSING --> INVENTORY_RESERVED: retry
+    PAYMENT_PROCESSING --> FAILED: max retries
+    PENDING --> CANCELLED
+    INVENTORY_RESERVED --> CANCELLED
+    PAYMENT_PROCESSING --> CANCELLED
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
 ```
 
-### Detailed Processing Sequence
+---
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant API as Flask API
-    participant DB as Database
-    participant Queue as Order Queue
-    participant Worker as Background Worker
-    participant InvSvc as Inventory Service
-    participant PaySvc as Payment Service
+## 3. Idempotency Design
 
-    rect rgb(240, 248, 255)
-        Client->>API: POST /orders<br/>Idempotency-Key: abc123<br/>Body: {items: [...]}
-        API->>DB: Check existing order by idempotency_key
-        alt Order exists
-            DB-->>API: Return existing order
-            API-->>Client: 200 OK (existing order)
-        else No existing order
-            API->>DB: Create new order (PENDING)
-            API->>Queue: enqueue_order(order_id)
-            API-->>Client: 201 Created (new order)
-        end
-    end
+- **Idempotency-Key** header required for order creation.
+- If a request with the same key is repeated, the same order is returned (no duplicate orders).
+- Enforced at the API and DB layer (unique constraint).
 
-    rect rgb(255, 248, 220)
-        Worker->>Queue: dequeue_order()
-        Queue-->>Worker: order_id
-        Worker->>DB: Fetch order with FOR UPDATE
-        Worker->>Worker: Check if cancelled/terminal state
+---
 
-        rect rgb(240, 255, 240)
-            Worker->>InvSvc: check_inventory(order)
-            InvSvc-->>Worker: {"success": true/false, "error": "..."}
-            alt Inventory success
-                Worker->>DB: Update status → INVENTORY_RESERVED
-            else Inventory failure
-                Worker->>Worker: Increment retry_count
-                alt Under max retries
-                    Worker->>DB: Reset to PENDING
-                    Worker->>Queue: enqueue_order(order_id) [RETRY]
-                else Max retries exceeded
-                    Worker->>DB: Update status → FAILED
-                end
-            end
-        end
+## 4. Retry Strategy
 
-        rect rgb(255, 240, 245)
-            Worker->>PaySvc: process_payment(order_id)
-            PaySvc-->>Worker: {"success": true/false, "payment_ref": "..."}
-            alt Payment success
-                Worker->>DB: Update status → COMPLETED<br/>Set payment_reference
-            else Payment failure
-                Worker->>Worker: Increment retry_count
-                alt Under max retries
-                    Worker->>DB: Reset to INVENTORY_RESERVED
-                    Worker->>Queue: enqueue_order(order_id) [RETRY]
-                else Max retries exceeded
-                    Worker->>InvSvc: release_inventory(order)
-                    Worker->>DB: Update status → FAILED
-                end
-            end
-        end
-    end
+- **Inventory and Payment:** Each has a retry counter (max 3 by default).
+- On failure, the order is re-queued for retry.
+- If max retries are exceeded, order is marked FAILED.
+- **Recovery Worker:** Scans for stuck orders and re-queues them, up to a max `recovery_attempts` (prevents infinite loops).
 
-    rect rgb(255, 245, 245)
-        Client->>API: POST /orders/{id}/cancel
-        API->>DB: Atomic UPDATE with WHERE<br/>status NOT IN (terminal_states)
-        alt Update succeeds (rowcount=1)
-            API-->>Client: 200 OK (cancelled)
-        else Update fails (rowcount=0)
-            API->>DB: Fetch current order status
-            DB-->>API: Current status
-            API-->>Client: 400 Bad Request<br/>(cannot cancel terminal state)
-        end
-    end
-```
+---
 
-### System Architecture Diagram
+## 5. Concurrency Handling
 
-````mermaid
-graph TB
-    subgraph "Client Layer"
-        Client[Client Applications<br/>Web/Mobile Apps]
-    end
+- **Database Locking:** `with_for_update()` used to prevent concurrent processing of the same order.
+- **Atomic Updates:** Order cancellation uses a conditional update to avoid race conditions with the worker.
+- **Thread-Safe Queue:** Python’s `queue.Queue` ensures safe access by multiple threads.
 
-    subgraph "API Layer"
-        Flask[Flask Application<br/>app.py]
-        Routes[Order Routes<br/>routes/order_routes.py]
-        Schema[Validation Schemas<br/>schema/order_schema.py]
-    end
+---
 
-    subgraph "Business Logic Layer"
-        OrderProcessor[Order Processor<br/>services/order_processor.py]
-        PaymentService[Payment Service<br/>services/payment_service.py]
-        InventoryService[Inventory Service<br/>services/inventory_service.py]
-    end
+## 6. Failure Scenarios (Project Specific)
 
-    subgraph "Worker Layer"
-        OrderWorker[Order Worker<br/>workers/order_worker.py]
-        RecoveryWorker[Recovery Worker<br/>workers/recovery_worker.py]
-        Queue[Queue System<br/>workers/queue.py]
-    end
+- **Worker Crash:** Recovery worker re-queues stuck orders.
+- **Database Unavailable:** API returns error, workers retry.
+- **Queue Overflow:** All orders are in-memory; if the app crashes, queued orders are lost.
+- **Max Recovery Attempts:** Orders stuck too long are marked FAILED.
+- **Race Conditions:** Prevented by DB locking and atomic updates.
 
-    subgraph "Data Layer"
-        SQLAlchemy[SQLAlchemy ORM<br/>models/]
-        OrderModel[Order Model<br/>models/orders.py]
-        StatusModel[Order Status<br/>models/orders_status.py]
-        DB[(SQLite Database<br/>orders.db)]
-    end
+---
 
-    subgraph "External Services"
-        PaymentGateway[Payment Gateway<br/>External API]
-        InventorySystem[Inventory System<br/>External API]
-    end
+## 7. Order Cancellation Design
 
-    subgraph "Infrastructure"
-        Logger[Logging System<br/>utils/logger.py]
-        Constants[Constants<br/>constants/order_constants.py]
-        Migrations[Database Migrations<br/>migrations/]
-    end
+- **Endpoint:** `/orders/{id}/cancel`
+- **Logic:** Only non-terminal orders can be cancelled.
+- **Atomicity:** Uses a single SQL update with a WHERE clause to ensure the order isn’t already completed/failed/cancelled.
+- **Idempotency:** Multiple cancel requests are safe.
 
-    Client --> Routes
-    Routes --> Schema
-    Routes --> SQLAlchemy
-    Routes --> Queue
+---
 
-    OrderWorker --> Queue
-    OrderWorker --> OrderProcessor
+## 8. Tradeoffs & Limitations
 
-    OrderProcessor --> PaymentService
-    OrderProcessor --> InventoryService
-    OrderProcessor --> SQLAlchemy
+- **In-memory Queue:** Simple, but queued orders are lost on restart.
+- **SQLite:** Easy to use, but not suitable for high concurrency or production at scale.
+- **No External Integrations:** Payment/inventory are simulated, not real services.
+- **No Authentication/Rate Limiting:** Not implemented, but can be added.
+- **No Horizontal Scaling:** Single-process, single-machine design.
+- **No Persistent Audit Log:** Logs are local only.
 
-    PaymentService --> PaymentGateway
-    InventoryService --> InventorySystem
+---
 
-    SQLAlchemy --> OrderModel
-    SQLAlchemy --> StatusModel
-    OrderModel --> DB
-    StatusModel --> DB
-
-    OrderWorker --> Logger
-    OrderProcessor --> Logger
-    Routes --> Logger
-
-    Migrations --> DB
-
-    style Client fill:#e1f5fe
-    style Flask fill:#f3e5f5
-    style OrderProcessor fill:#e8f5e8
-    style OrderWorker fill:#fff3e0
-- **Configuration conflicts**: Validation prevents incompatible settings
+**This document describes only the features and design present in your project. All advanced, unimplemented, or hypothetical features have been removed.**
 
 ## Failure Scenarios & Recovery
 
 ### System Failure Modes
 
 #### 1. **Worker Process Crash**
+
 **Scenario**: Background worker process terminates unexpectedly during order processing.
 
 **Impact**: Orders in progress may be left in intermediate states (INVENTORY_PROCESSING, PAYMENT_PROCESSING).
@@ -330,71 +124,73 @@ graph TB
 **Detection**: Worker health checks or missing heartbeat signals.
 
 **Recovery Strategy**:
+
 - Recovery worker scans for orders stuck in processing states
 - Orders older than threshold are reset to previous stable state
 - Automatic re-queuing for reprocessing
 - Manual intervention for complex cases
 
 **Prevention**:
+
 - Graceful shutdown handling
 - Process monitoring and auto-restart
-- Circuit breakers for external service failures
 
 #### 2. **Database Connection Loss**
+
 **Scenario**: Database becomes temporarily unavailable due to network issues or maintenance.
 
 **Impact**: All operations requiring database access fail.
 
-**Detection**: Connection pool exhaustion or timeout errors.
+**Detection**: Database connection errors or timeouts in logs.
 
 **Recovery Strategy**:
-- Connection retry with exponential backoff
-- Connection pool reconfiguration
-- Graceful degradation (read-only mode)
-- Automatic failover to backup database (if configured)
+
+- Application retries connection after a delay
+- Manual intervention if outage persists
 
 **Prevention**:
-- Connection pooling with health checks
-- Database clustering for high availability
-- Read replicas for query offloading
 
-#### 3. **External Service Failures**
-**Scenario**: Payment gateway or inventory service becomes unavailable.
+- Use a reliable database service
+- Monitor database health
+
+#### 3. **Inventory/Payment Service Failures**
+
+**Scenario**: Internal logic for payment or inventory fails (e.g., simulated failure in service code).
 
 **Impact**: Order processing stalls, affecting user experience.
 
-**Detection**: Service timeouts or error responses.
+**Detection**: Error logs and failed order status.
 
 **Recovery Strategy**:
-- Retry with exponential backoff
-- Circuit breaker pattern to fail fast
-- Fallback to manual processing
-- Service degradation notifications
+
+- Retry with exponential backoff (as implemented)
+- Mark order as FAILED after max retries
 
 **Prevention**:
-- Service monitoring and alerting
-- Multiple service providers
-- Service mesh for traffic management
+
+- Test service logic thoroughly
+- Monitor error logs
 
 #### 4. **Queue Overflow**
+
 **Scenario**: Order creation rate exceeds worker processing capacity.
 
 **Impact**: Memory exhaustion, system slowdown, order delays.
 
-**Detection**: Queue size monitoring, memory usage alerts.
+**Detection**: High memory usage, slow processing.
 
 **Recovery Strategy**:
-- Dynamic worker scaling (if supported)
-- Queue size limits with backpressure
-- Administrative intervention for capacity planning
-- Order prioritization (premium vs standard)
+
+- Restart application if memory is exhausted
+- Manually clear queue if needed
 
 **Prevention**:
-- Load testing and capacity planning
-- Auto-scaling infrastructure
-- Rate limiting at API level
+
+- Monitor order volume
+- Add queue size limits if needed
 
 #### 5. **Data Corruption**
+
 **Scenario**: Database corruption due to hardware failure or software bugs.
 
 **Impact**: Loss of order data, inconsistent state.
@@ -402,18 +198,21 @@ graph TB
 **Detection**: Data integrity checks, checksum validation.
 
 **Recovery Strategy**:
+
 - Point-in-time recovery from backups
 - Data reconciliation scripts
 - Manual data repair procedures
 - Service degradation during recovery
 
 **Prevention**:
+
 - Regular backups with integrity checks
 - Database replication
 - Data validation at application level
 - Hardware redundancy
 
 #### 6. **Race Conditions**
+
 **Scenario**: Concurrent operations on same order (e.g., worker processing + user cancellation).
 
 **Impact**: Inconsistent order state, lost updates.
@@ -421,18 +220,21 @@ graph TB
 **Detection**: State transition validation failures.
 
 **Recovery Strategy**:
+
 - Atomic operations with conditional updates
 - Optimistic locking with version columns
 - Conflict resolution policies
 - Manual state correction
 
 **Prevention**:
+
 - Database-level locking (`SELECT FOR UPDATE`)
 - Atomic conditional updates
 - State machine validation
 - Single-writer principle
 
 #### 7. **Memory Leaks**
+
 **Scenario**: Application memory usage grows over time due to improper resource management.
 
 **Impact**: Performance degradation, eventual crashes.
@@ -440,18 +242,21 @@ graph TB
 **Detection**: Memory usage monitoring, performance metrics.
 
 **Recovery Strategy**:
+
 - Process restart (if stateless)
 - Memory profiling and leak identification
 - Garbage collection tuning
 - Code fixes for resource leaks
 
 **Prevention**:
+
 - Memory profiling in development
 - Resource cleanup in finally blocks
 - Weak references for caches
 - Regular memory monitoring
 
 #### 8. **Network Partitioning**
+
 **Scenario**: Network issues isolate parts of the system from each other.
 
 **Impact**: Inconsistent views of order state across components.
@@ -459,12 +264,14 @@ graph TB
 **Detection**: Service health checks fail, timeout errors.
 
 **Recovery Strategy**:
+
 - Idempotent operations for safe retries
 - Eventual consistency with conflict resolution
 - Service discovery updates
 - Manual failover procedures
 
 **Prevention**:
+
 - Circuit breakers and timeouts
 - Retry logic with jitter
 - Service mesh for resilience
@@ -507,6 +314,7 @@ graph TB
 ### Monitoring & Alerting Strategy
 
 **Key Metrics to Monitor**:
+
 - Order processing latency and throughput
 - Error rates by component
 - Queue depth and processing rates
@@ -515,6 +323,7 @@ graph TB
 - Memory and CPU usage
 
 **Alert Conditions**:
+
 - Order processing > 5 minutes
 - Error rate > 5% over 5 minutes
 - Queue depth > 1000 orders
@@ -522,6 +331,7 @@ graph TB
 - External service timeouts > 10%
 
 **Alert Response**:
+
 - Low urgency: Log and monitor trends
 - Medium urgency: Investigate and potentially scale
 - High urgency: Immediate engineering response
@@ -534,12 +344,14 @@ graph TB
 **Considered Approach**: Use event sourcing with CQRS pattern, where order state changes emit events that drive processing.
 
 **Pros**:
+
 - Better audit trail and debugging capabilities
 - Loose coupling between components
 - Easy to add new event consumers (analytics, notifications)
 - Natural support for eventual consistency
 
 **Cons**:
+
 - Higher complexity and learning curve
 - Eventual consistency makes immediate reads challenging
 - Requires additional infrastructure (event store, message broker)
@@ -552,12 +364,14 @@ graph TB
 **Considered Approach**: Split into separate services (Order API, Payment Service, Inventory Service, Worker Service).
 
 **Pros**:
+
 - Independent scaling and deployment
 - Technology diversity (different languages/frameworks per service)
 - Fault isolation between services
 - Easier testing and maintenance of individual components
 
 **Cons**:
+
 - Distributed system complexity (service discovery, inter-service communication)
 - Eventual consistency challenges
 - Increased operational overhead (monitoring, deployment, networking)
@@ -570,12 +384,14 @@ graph TB
 **Considered Approach**: Process orders synchronously in the API request, eliminating the need for background workers.
 
 **Pros**:
+
 - Simpler architecture (no queues, workers, or async processing)
 - Immediate feedback to users
 - Easier debugging and tracing
 - No eventual consistency issues
 
 **Cons**:
+
 - Poor user experience for slow operations (payment processing can take seconds)
 - API timeouts and failures under load
 - Tight coupling between API and business logic
@@ -588,12 +404,14 @@ graph TB
 **Considered Approach**: Each service (orders, inventory, payments) has its own database.
 
 **Pros**:
+
 - Independent data evolution
 - Better fault isolation
 - Technology choice per service
 - Reduced coupling between services
 
 **Cons**:
+
 - Complex data consistency (distributed transactions or sagas)
 - Cross-service queries difficult
 - Increased operational complexity
@@ -606,12 +424,14 @@ graph TB
 **Considered Approach**: Replace REST API with GraphQL for more flexible data fetching.
 
 **Pros**:
+
 - Single endpoint for all data needs
 - Client-driven data requirements
 - Reduced over/under-fetching
 - Strong typing with schema
 
 **Cons**:
+
 - Increased complexity for simple CRUD operations
 - Caching challenges
 - Security concerns (query complexity attacks)
@@ -624,12 +444,14 @@ graph TB
 **Considered Approach**: Use AWS Lambda or similar for API and worker functions.
 
 **Pros**:
+
 - Automatic scaling
 - Pay-per-use pricing
 - Zero maintenance overhead
 - Built-in fault tolerance
 
 **Cons**:
+
 - Cold start latency
 - Vendor lock-in
 - Complex local development
@@ -643,12 +465,14 @@ graph TB
 **Considered Approach**: Separate read and write models with event sourcing.
 
 **Pros**:
+
 - Optimized reads and writes
 - Rich domain modeling
 - Easy to add new read models
 - Better performance for complex queries
 
 **Cons**:
+
 - Significant complexity increase
 - Eventual consistency challenges
 - Requires event sourcing foundation
@@ -681,7 +505,7 @@ class Order(db.Model):
     recovery_attempts: Integer (default: 0)
     created_at: DateTime
     updated_at: DateTime
-````
+```
 
 **Design Choices & Rationale:**
 
@@ -796,42 +620,39 @@ class Order(db.Model):
 
 ### Database Design
 
-**Technology**: SQLite for development, designed for PostgreSQL/MySQL in production.
+**Technology**: SQLite (single file, no clustering)
 
 **Design Choices & Rationale:**
 
 - **ACID compliance**: SQLite provides full ACID guarantees for data consistency
 - **Migrations with Alembic**: Version-controlled schema changes with rollback capability
-- **Connection pooling**: SQLAlchemy handles connection management automatically
-- **Optimistic locking**: Version columns could be added for concurrent update detection
+- **Connection management**: SQLAlchemy handles connections automatically
 
 **Tradeoffs:**
 
-- **SQLite vs PostgreSQL**: SQLite chosen for simplicity in development; PostgreSQL provides better concurrency and features for production
-- **ORM vs raw SQL**: SQLAlchemy chosen for productivity and security; raw SQL would be faster but more error-prone
+- **SQLite**: Chosen for simplicity and ease of use; not suitable for high-concurrency production
+- **ORM**: SQLAlchemy chosen for productivity and security
 
 **Failure Cases:**
 
 - **Database corruption**: Backup/restore procedures needed (not implemented)
-- **Connection pool exhaustion**: SQLAlchemy handles pooling automatically
 - **Concurrent updates**: `with_for_update()` prevents lost updates
 - **Migration failures**: Alembic provides rollback to previous schema version
 
 ### Logging and Monitoring Design
 
-**Implementation**: Structured logging with context information.
+**Implementation**: Local logging to console or file.
 
 **Design Choices & Rationale:**
 
-- **Structured logging**: JSON format enables log aggregation and querying
-- **Context propagation**: Request IDs and order IDs included in all log entries
+- **Simple logging**: Uses Python's logging module for console/file output
 - **Multiple log levels**: DEBUG for development, INFO/WARN/ERROR for production
 - **Performance-conscious**: Logging doesn't block critical paths
 
 **Tradeoffs:**
 
-- **Synchronous vs asynchronous logging**: Synchronous chosen for simplicity; async would improve performance but add complexity
-- **Local vs centralized logging**: Local logging chosen for simplicity; centralized requires additional infrastructure
+- **Synchronous logging**: Chosen for simplicity
+- **Local logging**: No aggregation or external log management
 
 **Failure Cases:**
 
