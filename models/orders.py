@@ -19,6 +19,7 @@ class Order(db.Model):
     payment_retry_count = db.Column(db.Integer, default=0)
     inventory_retry_count = db.Column(db.Integer, default=0)
     payment_reference = db.Column(db.String, nullable=True)
+    recovery_attempts = db.Column(db.Integer, default=0)
 
     created_at = db.Column(
         db.DateTime(timezone=True),

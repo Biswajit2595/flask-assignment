@@ -22,7 +22,7 @@ def upgrade():
                 'idempotency_key',
                 sa.String(length=255),
                 nullable=True,
-                unique=True        # ← inline, no separate constraint call
+                unique=True      
             )
         )
 
